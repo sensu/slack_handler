@@ -1,27 +1,38 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"regexp"
+	"strings"
+
 	corev2 "github.com/sensu/sensu-go/api/core/v2"
 	"github.com/sensu/sensu-plugins-go-library/sensu"
-	"strings"
 
 	"github.com/bluele/slack"
 )
 
 type HandlerConfig struct {
 	sensu.PluginConfig
-	SlackWebhookUrl string
-	SlackChannel    string
-	SlackUsername   string
-	SlackIconUrl    string
+	SlackWebhookUrl          string
+	SlackChannel             string
+	SlackUsername            string
+	SlackIconUrl             string
+	redactMatch              string
+	redact                   bool
+	SlackIncludeCheckLabels  bool
+	SlackIncludeEntityLabels bool
 }
 
 const (
-	webHookUrl = "webhook-url"
-	channel    = "channel"
-	userName   = "username"
-	iconUrl    = "icon-url"
+	webHookUrl      = "webhook-url"
+	channel         = "channel"
+	userName        = "username"
+	iconUrl         = "icon-url"
+	incCheckLabels  = "include-check-labels"
+	incEntityLabels = "include-entity-labels"
+	redactMatch     = "redact-match"
+	redact          = "redact"
 )
 
 var (
@@ -43,6 +54,24 @@ var (
 			Default:   "",
 			Usage:     "The webhook url to send messages to, defaults to value of SLACK_WEBHOOK_URL env variable",
 			Value:     &config.SlackWebhookUrl,
+		},
+		{
+			Path:      redactMatch,
+			Env:       "SENSU_SLACK_REDACTMATCH",
+			Argument:  redactMatch,
+			Shorthand: "m",
+			Default:   "(?i).*(pass|key).*",
+			Usage:     "Regex to redact values of matching labels",
+			Value:     &config.redactMatch,
+		},
+		{
+			Path:      redact,
+			Env:       "SENSU_SLACK_REDACTMATCH",
+			Argument:  redact,
+			Shorthand: "r",
+			Default:   false,
+			Usage:     "Enable redaction of labels",
+			Value:     &config.redact,
 		},
 		{
 			Path:      channel,
@@ -71,6 +100,24 @@ var (
 			Usage:     "A URL to an image to use as the user avatar",
 			Value:     &config.SlackIconUrl,
 		},
+		{
+			Path:      incCheckLabels,
+			Env:       "SENSU_SLACK_INCLUDE_CHECK_LABELS",
+			Argument:  incCheckLabels,
+			Shorthand: "l",
+			Default:   false,
+			Usage:     "Include check labels in slack message?",
+			Value:     &config.SlackIncludeCheckLabels,
+		},
+		{
+			Path:      incEntityLabels,
+			Env:       "SENSU_SLACK_INCLUDE_ENTITY_LABELS",
+			Argument:  incEntityLabels,
+			Shorthand: "e",
+			Default:   false,
+			Usage:     "Include entity labels in slack message?",
+			Value:     &config.SlackIncludeEntityLabels,
+		},
 	}
 )
 
@@ -79,12 +126,20 @@ func main() {
 	goHandler.Execute()
 }
 
-func checkArgs(_ *corev2.Event) error {
+func checkArgs(_ *corev2.Event) (e error) {
 	if len(config.SlackWebhookUrl) == 0 {
 		return fmt.Errorf("--webhook-url or SENSU_SLACK_WEBHOOK_URL environment variable is required")
 	}
 
-	return nil
+	// validate the regex compiles, if not catch the panic and return error
+	defer func() {
+		if r := recover(); r != nil {
+			e = fmt.Errorf("regexp (%s) specified by SENSU_SLACK_REDACT or --redact is invalid", config.redactMatch)
+		}
+		return
+	}()
+	regexp.MustCompile(config.redactMatch)
+	return
 }
 
 func formattedEventAction(event *corev2.Event) string {
@@ -114,6 +169,52 @@ func eventSummary(event *corev2.Event, maxLength int) string {
 
 func formattedMessage(event *corev2.Event) string {
 	return fmt.Sprintf("%s - %s", formattedEventAction(event), eventSummary(event, 100))
+}
+
+func attachCheckLabels(event *corev2.Event, attachment *slack.Attachment, config HandlerConfig) {
+	re := regexp.MustCompile(config.redactMatch)
+	if event.Check.Labels == nil {
+		return
+	}
+
+	buf := bytes.Buffer{}
+	for k, v := range event.Check.Labels {
+		if config.redact && re.MatchString(k) {
+			v = "**REDACTED**"
+		}
+		fmt.Fprintf(&buf, "%s=%s\n", k, v)
+	}
+
+	attachment.Fields = append(attachment.Fields, &slack.AttachmentField{
+		Title: "Check Labels",
+		Value: buf.String(),
+		Short: false,
+	})
+
+	return
+}
+
+func attachEntityLabels(event *corev2.Event, attachment *slack.Attachment, config HandlerConfig) {
+	re := regexp.MustCompile(config.redactMatch)
+	if event.Entity.Labels == nil {
+		return
+	}
+
+	buf := bytes.Buffer{}
+	for k, v := range event.Entity.Labels {
+		if config.redact && re.MatchString(k) {
+			v = "**REDACTED**"
+		}
+		fmt.Fprintf(&buf, "%s=%s\n", k, v)
+	}
+
+	attachment.Fields = append(attachment.Fields, &slack.AttachmentField{
+		Title: "Entity Labels",
+		Value: buf.String(),
+		Short: false,
+	})
+
+	return
 }
 
 func messageColor(event *corev2.Event) string {
@@ -162,6 +263,15 @@ func messageAttachment(event *corev2.Event) *slack.Attachment {
 			},
 		},
 	}
+
+	if config.SlackIncludeEntityLabels {
+		attachEntityLabels(event, attachment, config)
+	}
+
+	if config.SlackIncludeCheckLabels {
+		attachCheckLabels(event, attachment, config)
+	}
+
 	return attachment
 }
 
